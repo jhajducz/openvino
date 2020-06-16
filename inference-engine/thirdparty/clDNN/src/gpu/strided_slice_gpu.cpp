@@ -1,5 +1,5 @@
 /*
-// Copyright (c) 2019 Intel Corporation
+// Copyright (c) 2019-2020 Intel Corporation
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -77,10 +77,14 @@ public:
         // If the ith bit of end_mask is not set, end[i] is ignored and the fullest possible range in that dimension is used
         // instead.
         vector_assign_if_not_mask(params.striding_params[1], out_shape, params.end_mask);
-
         for (size_t dim = 0; dim < params.striding_params[2].size(); dim++) {
-            auto begin = params.striding_params[0][dim] < 0 ? out_shape[dim] + params.striding_params[0][dim] : params.striding_params[0][dim];
-            auto end = params.striding_params[1][dim] < 0 ? out_shape[dim] + params.striding_params[1][dim] : params.striding_params[1][dim];
+            if (params.striding_params[0][dim] < 0)
+                params.striding_params[0][dim] = out_shape[dim] + params.striding_params[0][dim];
+            if (params.striding_params[1][dim] < 0)
+                params.striding_params[1][dim] = out_shape[dim] + params.striding_params[1][dim];
+
+            auto begin = params.striding_params[0][dim];
+            auto end = params.striding_params[1][dim];
             auto stride = params.striding_params[2][dim];
             if (stride < 0 && (end > begin)) {
                 std::swap(params.striding_params[0][dim], params.striding_params[1][dim]);
