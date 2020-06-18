@@ -79,16 +79,27 @@ public:
         vector_assign_if_not_mask(params.striding_params[1], out_shape, params.end_mask);
         for (size_t dim = 0; dim < params.striding_params[2].size(); dim++) {
             if (params.striding_params[0][dim] < 0)
-                params.striding_params[0][dim] = out_shape[dim] + params.striding_params[0][dim];
+                params.striding_params[0][dim] = std::max(out_shape[dim] + params.striding_params[0][dim], (int32_t)0);
             if (params.striding_params[1][dim] < 0)
-                params.striding_params[1][dim] = out_shape[dim] + params.striding_params[1][dim];
+                params.striding_params[1][dim] = std::max(out_shape[dim] + params.striding_params[1][dim], (int32_t)0);
 
-            auto begin = params.striding_params[0][dim];
-            auto end = params.striding_params[1][dim];
-            auto stride = params.striding_params[2][dim];
-            if (stride < 0 && (end > begin)) {
-                std::swap(params.striding_params[0][dim], params.striding_params[1][dim]);
-                params.striding_params[0][dim] = params.striding_params[0][dim] - 1;
+            params.striding_params[0][dim] = std::min(params.striding_params[0][dim], out_shape[dim]);
+            params.striding_params[1][dim] = std::min(params.striding_params[1][dim], out_shape[dim]);
+
+            auto& begin = params.striding_params[0][dim];
+            auto& end = params.striding_params[1][dim];
+            auto& stride = params.striding_params[2][dim];
+
+            if ((stride < 0) && (begin < end)) {
+                cldnn::tensor::value_type new_begin = std::min(end, out_shape[dim] - 1);
+                cldnn::tensor::value_type new_end = begin;
+                if (((end - begin) % (-stride)) == 0) {
+                    new_begin = std::max(end - 1, 0);
+                }
+                new_begin = begin + ((new_begin - new_end) / (-stride)) * (-stride);
+                new_end = new_end - 1;
+                params.striding_params[0][dim] = new_begin;
+                params.striding_params[1][dim] = new_end;
             }
         }
 
