@@ -17,6 +17,7 @@ namespace pass {
 class TRANSFORMATIONS_API MVNFusion;
 class TRANSFORMATIONS_API MVNFusionWithoutConstants;
 class TRANSFORMATIONS_API MVNFusionWithConstantsInside;
+class TRANSFORMATIONS_API MVNFusionWithConstantsInside_v2;
 
 }  // namespace pass
 }  // namespace ov
@@ -46,6 +47,21 @@ public:
 
 /**
  * @ingroup ov_transformation_common_api
+ * @brief MVNFusion transformation replaces following operations to MVN op.
+ * y = x * inv_sqrt_var * gamma + bias - mean * inv_sqrt_var * gamma
+ * where:
+ *     mean = Reshape(ReduceMean(x, axes), new_shape)
+ *     mean_centered_x = x - mean
+ *     inv_sqrt_var = Sqrt(ReduceMean(mean_centered_x * mean_centered_x) + eps)
+ */
+class ov::pass::MVNFusionWithConstantsInside_v2 : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("MVNFusionWithConstantsInside_v2");
+    MVNFusionWithConstantsInside_v2();
+};
+
+/**
+ * @ingroup ov_transformation_common_api
  * @brief MVNFusion transformation replaces various sub-graphs with a MVN op.
  */
 class ov::pass::MVNFusion : public ov::pass::GraphRewrite {
@@ -54,5 +70,6 @@ public:
     MVNFusion() {
         add_matcher<ov::pass::MVNFusionWithoutConstants>();
         add_matcher<ov::pass::MVNFusionWithConstantsInside>();
+        add_matcher<ov::pass::MVNFusionWithConstantsInside_v2>();
     }
 };

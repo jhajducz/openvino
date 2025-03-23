@@ -17,6 +17,7 @@
 #include "openvino/op/mvn.hpp"
 #include "openvino/op/power.hpp"
 #include "openvino/op/reduce_mean.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/sqrt.hpp"
 #include "openvino/op/squared_difference.hpp"
 #include "openvino/op/subtract.hpp"
@@ -310,5 +311,177 @@ ov::pass::MVNFusionWithConstantsInside::MVNFusionWithConstantsInside() {
     };
 
     auto m = std::make_shared<ov::pass::pattern::Matcher>(add, matcher_name);
+    register_matcher(m, matcher_pass_callback);
+}
+
+ov::pass::MVNFusionWithConstantsInside_v2::MVNFusionWithConstantsInside_v2() {
+    MATCHER_SCOPE(MVNFusionWithConstantsInside_v2);
+
+    auto has_real_not_quantized_type = [](const ov::Output<ov::Node>& output) -> bool {
+        const auto& T = output.get_element_type();
+        return (T.is_real() && (!T.is_quantized()));
+    };
+
+    auto has_integral_type = [](const ov::Output<ov::Node>& output) -> bool {
+        const auto& T = output.get_element_type();
+        return (T.is_integral_number());
+    };
+
+    auto has_single_value = [](const ov::Output<ov::Node>& output) -> bool {
+        const auto& output_shape = output.get_shape();
+        return (ov::shape_size(output_shape) == 1);
+    };
+
+    // Detect following MVN decomposition pattern:
+    // y = x * inv_sqrt_var * gamma + bias - mean * inv_sqrt_var * gamma
+    // where:
+    //     mean = Reshape(ReduceMean(x, axes), new_shape)
+    //     mean_centered_x = x - mean
+    //     inv_sqrt_var = Sqrt(ReduceMean(mean_centered_x * mean_centered_x) + eps)
+
+    auto x = pattern::any_input();
+
+    auto mean_axes = pattern::wrap_type<ov::op::v0::Constant>();
+    auto mean_before_opt_reshape = pattern::wrap_type<ov::op::v1::ReduceMean>({x, mean_axes});
+    auto opt_reshape_new_shape = pattern::wrap_type<ov::op::v0::Constant>();
+    auto mean = pattern::optional<ov::op::v1::Reshape>({mean_before_opt_reshape, opt_reshape_new_shape});
+
+    auto mean_centered_x = pattern::wrap_type<ov::op::v1::Subtract>({x, mean});
+
+    auto mean_centered_x_squared = pattern::wrap_type<ov::op::v1::Multiply>({mean_centered_x, mean_centered_x});
+    auto var_axes = pattern::wrap_type<ov::op::v0::Constant>();
+    auto var = pattern::wrap_type<ov::op::v1::ReduceMean>({mean_centered_x_squared, var_axes});
+    auto eps_const = pattern::wrap_type<ov::op::v0::Constant>(
+        ov::pass::pattern::all_of({pattern::has_static_shape(), has_single_value, has_real_not_quantized_type}));
+    auto eps_quantized = pattern::wrap_type<ov::op::v0::Constant>(
+        ov::pass::pattern::all_of({pattern::has_static_shape(), has_single_value, has_integral_type}));
+    auto eps_quant_convert = pattern::wrap_type<ov::op::v0::Convert>({eps_quantized});
+    auto eps_zp_quantized = pattern::wrap_type<ov::op::v0::Constant>(
+        ov::pass::pattern::all_of({pattern::has_static_shape(), has_single_value, has_integral_type}));
+    auto eps_zp_convert = pattern::wrap_type<ov::op::v0::Convert>({eps_zp_quantized});
+    auto eps_zp_subtract = pattern::wrap_type<ov::op::v1::Subtract>({eps_quant_convert, eps_zp_convert});
+    auto eps_scale = pattern::wrap_type<ov::op::v0::Constant>(
+        ov::pass::pattern::all_of({pattern::has_static_shape(), has_single_value, has_real_not_quantized_type}));
+    auto eps_dequantized = pattern::wrap_type<ov::op::v1::Multiply>({eps_zp_subtract, eps_scale});
+    auto eps = std::make_shared<pattern::op::Or>(OutputVector{eps_const, eps_dequantized});
+    auto var_plus_eps = pattern::wrap_type<ov::op::v1::Add>({var, eps});
+    auto sqrt = pattern::wrap_type<ov::op::v0::Sqrt>({var_plus_eps});
+    auto ones = pattern::wrap_type<ov::op::v0::Constant>(
+        ov::pass::pattern::all_of({pattern::has_static_shape(), has_single_value, has_real_not_quantized_type}));
+    auto inv_sqrt_var = pattern::wrap_type<ov::op::v1::Divide>({ones, sqrt});
+
+    // x * inv_sqrt_var * gamma
+    auto gamma = pattern::any_input();
+    auto scaled_inv_sqrt_var = pattern::wrap_type<ov::op::v1::Multiply>({inv_sqrt_var, gamma});
+    auto x_mult_by_scaled_inv_sqrt_var = pattern::wrap_type<ov::op::v1::Multiply>({x, scaled_inv_sqrt_var});
+
+    // beta - mean * inv_sqrt_var * gamma
+    auto mean_mult_by_scaled_inv_sqrt_var = pattern::wrap_type<ov::op::v1::Multiply>({mean, scaled_inv_sqrt_var});
+    auto beta = pattern::any_input();
+    auto beta_minus_mean_mult_by_scaled_inv_sqrt_var =
+        pattern::wrap_type<ov::op::v1::Subtract>({beta, mean_mult_by_scaled_inv_sqrt_var});
+
+    // y = x * inv_sqrt * gamma + beta - mean * inv_sqrt_var * gamma
+    auto y = pattern::wrap_type<ov::op::v1::Add>(
+        {x_mult_by_scaled_inv_sqrt_var, beta_minus_mean_mult_by_scaled_inv_sqrt_var});
+
+    ov::matcher_pass_callback matcher_pass_callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& pattern_to_output = m.get_pattern_value_map();
+        auto x_output = pattern_to_output.at(x);
+
+        float eps_value;
+
+        if (pattern_to_output.count(eps_const) > 0) {
+            auto const_eps_node =
+                ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(eps_const).get_node_shared_ptr());
+            if (!const_eps_node)
+                return false;
+            bool valid_eps_value = op::util::get_single_value(const_eps_node, eps_value);
+            if (!valid_eps_value)
+                return false;
+        } else if ((pattern_to_output.count(eps_dequantized) > 0) && (pattern_to_output.count(eps_zp_quantized) > 0) &&
+                   (pattern_to_output.count(eps_scale) > 0)) {
+            auto const_eps_quantized_node =
+                ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(eps_quantized).get_node_shared_ptr());
+            auto const_eps_zp_quantized_node =
+                ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(eps_zp_quantized).get_node_shared_ptr());
+            auto const_eps_scale_node =
+                ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(eps_scale).get_node_shared_ptr());
+
+            if ((!const_eps_quantized_node) || (!const_eps_zp_quantized_node) || (!const_eps_scale_node))
+                return false;
+
+            if (const_eps_quantized_node->get_output_element_type(0) !=
+                const_eps_zp_quantized_node->get_output_element_type(0))
+                return false;
+
+            float eps_quantized_flt_val, eps_zp_flt_val, eps_scale_val;
+            bool valid_eps_quantized_flt_val =
+                op::util::get_single_value(const_eps_quantized_node, eps_quantized_flt_val);
+            if (!valid_eps_quantized_flt_val)
+                return false;
+            bool valid_eps_zp_flt_val = op::util::get_single_value(const_eps_zp_quantized_node, eps_zp_flt_val);
+            if (!valid_eps_zp_flt_val)
+                return false;
+            bool valid_eps_scale_val = op::util::get_single_value(const_eps_scale_node, eps_scale_val);
+            if (!valid_eps_scale_val)
+                return false;
+
+            eps_value = eps_scale_val * (eps_quantized_flt_val - eps_zp_flt_val);
+        } else {
+            return false;
+        }
+
+        auto const_ones_node = ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(ones).get_node_shared_ptr());
+        if (!const_ones_node) {
+            return false;
+        }
+
+        bool valid_ones_values = op::util::has_constant_value<float>(const_ones_node, 1);
+        if (!valid_ones_values) {
+            return false;
+        }
+
+        auto const_mean_axes_node =
+            ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(mean_axes).get_node_shared_ptr());
+        auto const_variance_axes_node =
+            ov::as_type_ptr<ov::op::v0::Constant>(pattern_to_output.at(var_axes).get_node_shared_ptr());
+        if (!const_mean_axes_node || !const_variance_axes_node) {
+            return false;
+        }
+
+        auto mean_axes_value = const_mean_axes_node->cast_vector<int64_t>();
+        auto variance_axes_value = const_variance_axes_node->cast_vector<int64_t>();
+        if (mean_axes_value != variance_axes_value) {
+            return false;
+        }
+
+        auto mvn = std::make_shared<ov::op::v6::MVN>(x_output,
+                                                     const_mean_axes_node,
+                                                     true,
+                                                     eps_value,
+                                                     op::MVNEpsMode::INSIDE_SQRT);
+        auto mul_gamma = std::make_shared<ov::op::v1::Multiply>(mvn, pattern_to_output.at(gamma));
+        auto add_beta = std::make_shared<ov::op::v1::Add>(mul_gamma, pattern_to_output.at(beta));
+        ov::copy_runtime_info({pattern_to_output.at(mean_before_opt_reshape).get_node_shared_ptr(),
+                               pattern_to_output.at(mean).get_node_shared_ptr(),
+                               pattern_to_output.at(mean_centered_x).get_node_shared_ptr(),
+                               pattern_to_output.at(mean_centered_x_squared).get_node_shared_ptr(),
+                               pattern_to_output.at(var).get_node_shared_ptr(),
+                               pattern_to_output.at(var_plus_eps).get_node_shared_ptr(),
+                               pattern_to_output.at(inv_sqrt_var).get_node_shared_ptr(),
+                               pattern_to_output.at(scaled_inv_sqrt_var).get_node_shared_ptr(),
+                               pattern_to_output.at(x_mult_by_scaled_inv_sqrt_var).get_node_shared_ptr(),
+                               pattern_to_output.at(mean_mult_by_scaled_inv_sqrt_var).get_node_shared_ptr(),
+                               pattern_to_output.at(beta_minus_mean_mult_by_scaled_inv_sqrt_var).get_node_shared_ptr(),
+                               pattern_to_output.at(y).get_node_shared_ptr()},
+                              {mvn, mul_gamma, add_beta});
+        add_beta->set_friendly_name(m.get_match_root()->get_friendly_name());
+        ov::replace_node(m.get_match_root(), add_beta);
+
+        return true;
+    };
+
+    auto m = std::make_shared<ov::pass::pattern::Matcher>(y, matcher_name);
     register_matcher(m, matcher_pass_callback);
 }
