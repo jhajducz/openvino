@@ -20,7 +20,7 @@ layout mvn_inst::calc_output_layout(mvn_node const& node, kernel_impl_params con
         output_type = data_types::f32;
     }
 
-    return layout(output_type, input_node_layout.format, input_node_layout.get_tensor());
+    return layout(output_type, cldnn::format::byxf, input_node_layout.get_tensor());
 }
 
 std::string mvn_inst::to_string(mvn_node const& node) {
